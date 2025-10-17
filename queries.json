@@ -1,0 +1,104 @@
+{
+  "version": "1.0",
+  "default_connection": "ORCL_ODBC",
+  "dialects": {
+    "oracle": {
+      "paramstyle": "qmark",
+      "ident_quote": "\"",
+      "limit": { "style": "fetch_first", "template": "FETCH FIRST {n} ROWS ONLY" },
+      "functions": {
+        "coalesce": "COALESCE({0}, {1})",
+        "concat2": "({0} || {1})",
+        "year": "EXTRACT(YEAR FROM {0})",
+        "ilike": "LOWER({0}) LIKE LOWER({1})"
+      }
+    },
+    "sybase_ase": {
+      "paramstyle": "qmark",
+      "ident_quote": "\"",
+      "limit": { "style": "top", "template": "TOP {n}" },
+      "functions": {
+        "coalesce": "ISNULL({0}, {1})",
+        "concat2": "({0} + {1})",
+        "year": "DATEPART(yy, {0})",
+        "ilike": "{0} LIKE {1}"
+      }
+    },
+    "postgresql": {
+      "paramstyle": "qmark",
+      "ident_quote": "\"",
+      "limit": { "style": "limit", "template": "LIMIT {n} OFFSET {o}" },
+      "functions": {
+        "coalesce": "COALESCE({0}, {1})",
+        "concat2": "({0} || {1})",
+        "year": "EXTRACT(YEAR FROM {0})",
+        "ilike": "{0} ILIKE {1}"
+      }
+    }
+  },
+  "connections": [
+    {
+      "name": "ORCL_ODBC",
+      "dialect": "oracle",
+      "driver": "{Oracle in OraClient19Home1}",
+      "dsn": "ORATEST",
+      "user_env": "ORACLE_UID",
+      "password_env": "ORACLE_PWD",
+      "options": { "encoding": "UTF-8" }
+    }
+  ],
+  "catalog": {
+    "tables": [
+      {
+        "name": "HR.EMPLOYEES",
+        "alias": "e",
+        "columns": [
+          { "name": "EMPLOYEE_ID", "type": "NUMBER", "label": "ID", "pk": true },
+          { "name": "FIRST_NAME", "type": "VARCHAR2(50)", "label": "First" },
+          { "name": "LAST_NAME", "type": "VARCHAR2(50)", "label": "Last" },
+          { "name": "DEPARTMENT_ID", "type": "NUMBER", "label": "Dept ID" },
+          { "name": "HIRE_DATE", "type": "DATE", "label": "Hire Date" },
+          { "name": "SALARY", "type": "NUMBER", "label": "Salary" }
+        ]
+      },
+      {
+        "name": "HR.DEPARTMENTS",
+        "alias": "d",
+        "columns": [
+          { "name": "DEPARTMENT_ID", "type": "NUMBER", "label": "Dept ID", "pk": true },
+          { "name": "DEPARTMENT_NAME", "type": "VARCHAR2(60)", "label": "Department" }
+        ]
+      }
+    ],
+    "expressions": {
+      "full_name": {
+        "args": ["e.FIRST_NAME", "e.LAST_NAME"],
+        "by_dialect": {
+          "oracle": "({0} || ' ' || {1})",
+          "sybase_ase": "({0} + ' ' + {1})",
+          "postgresql": "({0} || ' ' || {1})"
+        },
+        "label": "Employee"
+      },
+      "annual_cost": {
+        "args": ["e.SALARY"],
+        "by_dialect": {
+          "oracle": "COALESCE({0}, 0) * 12",
+          "sybase_ase": "ISNULL({0}, 0) * 12",
+          "postgresql": "COALESCE({0}, 0) * 12"
+        },
+        "label": "Annual Cost"
+      },
+      "hire_year": {
+        "args": ["e.HIRE_DATE"],
+        "by_dialect": {
+          "oracle": "EXTRACT(YEAR FROM {0})",
+          "sybase_ase": "DATEPART(yy, {0})",
+          "postgresql": "EXTRACT(YEAR FROM {0})"
+        },
+        "label": "Hire Year"
+      }
+    }
+  }
+}
+

@@ -1,0 +1,43 @@
+{
+  "views": [
+    {
+      "id": "emp_by_dept",
+      "title": "Employees by Department",
+      "connection": "ORCL_ODBC",
+      "from": [
+        { "table": "HR.EMPLOYEES", "alias": "e" },
+        { "table": "HR.DEPARTMENTS", "alias": "d",
+          "join": { "type": "INNER", "on": "e.DEPARTMENT_ID = d.DEPARTMENT_ID" }
+        }
+      ],
+      "select": [
+        { "kind": "column", "expr": "e.EMPLOYEE_ID", "alias": "employee_id", "label": "ID" },
+        { "kind": "expr", "ref": "full_name", "alias": "full_name", "label": "Employee" },
+        { "kind": "column", "expr": "d.DEPARTMENT_NAME", "alias": "department", "label": "Department" },
+        { "kind": "expr", "ref": "hire_year", "alias": "hire_year", "label": "Hire Year" },
+        { "kind": "expr", "ref": "annual_cost", "alias": "annual_cost", "label": "Annual Cost" }
+      ],
+      "filters": [
+        {
+          "id": "dept_like",
+          "label": "Department contains",
+          "enabled": true,
+          "where": "LOWER(d.DEPARTMENT_NAME) LIKE LOWER(?)",
+          "param_order": ["dept_like"],
+          "default": "%"
+        },
+        {
+          "id": "min_hire_year",
+          "label": "Min Hire Year",
+          "enabled": false,
+          "where": "EXTRACT(YEAR FROM e.HIRE_DATE) >= ?",
+          "param_order": ["min_hire_year"]
+        }
+      ],
+      "order_by": ["department ASC", "full_name ASC"],
+      "limit": { "rows": 1000, "offset": 0 },
+      "overrides": {}
+    }
+  ]
+}
+

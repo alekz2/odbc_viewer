@@ -1,0 +1,241 @@
+# ui/main_window.py
+# Python 3.6.9
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
+    QLabel, QSplitter, QPushButton, QFileDialog, QMessageBox, QTableView, QStatusBar
+)
+
+from odbc_viewer.core.datasource import DataSource
+from odbc_viewer.core.sqlbuilder import SQLBuilder
+from odbc_viewer.core.config import Config, ConfigError
+from odbc_viewer.core.cache import DFCache
+from odbc_viewer.ui.filter_form import FilterForm
+from odbc_viewer.ui.models import DataFrameModel
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, cfg, cache_capacity=10):
+        super().__init__()
+        self.setWindowTitle("PyQt5 ODBC Viewer (cached)")
+        self.resize(1200, 750)
+
+        self._cfg = cfg
+        self._builder = SQLBuilder(cfg.queries)
+        self._views = cfg.views
+        self._view_by_id = {v["id"]: v for v in self._views}
+        self._current_view = None
+
+        self._cache = DFCache(capacity=cache_capacity)
+        self._last_key_by_view = {}  # view_id -> last DFCache key (snapshot to show on select/double-click)
+
+        self._build_ui()
+
+        # populate list
+        for v in self._views:
+            it = QListWidgetItem("{}  ({})".format(v.get("title", v["id"]), v["id"]))
+            it.setData(Qt.UserRole, v["id"])
+            self.list_views.addItem(it)
+
+        # default selection builds filters (no DB query), then tries to show cached snapshot
+        if self.list_views.count() > 0:
+            self.list_views.setCurrentRow(0)
+            self._load_current_view()
+            self._try_show_cached_current()
+
+    # ---------------- UI wiring ----------------
+    def _build_ui(self):
+        splitter = QSplitter(self)
+        self.setCentralWidget(splitter)
+
+        # LEFT: views list
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.addWidget(QLabel("Views"))
+        self.list_views = QListWidget()
+        self.list_views.currentItemChanged.connect(self._on_selection_changed)
+        self.list_views.itemDoubleClicked.connect(self._on_double_click)  # show cached snapshot on double-click
+        left_layout.addWidget(self.list_views)
+        splitter.addWidget(left)
+
+        # RIGHT: filters + buttons + table
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+
+        self.filters_form = FilterForm()
+        right_layout.addWidget(self.filters_form)
+
+        btn_row = QHBoxLayout()
+        self.btn_run = QPushButton("Run")
+        self.btn_run.clicked.connect(self._run_current_view)  # only path that may hit DB
+        btn_row.addWidget(self.btn_run)
+
+        self.btn_load_cfg = QPushButton("Load queries.json…")
+        self.btn_load_cfg.clicked.connect(self._open_cfg)
+        btn_row.addWidget(self.btn_load_cfg)
+
+        self.btn_load_views = QPushButton("Load views…")
+        self.btn_load_views.clicked.connect(self._open_views)
+        btn_row.addWidget(self.btn_load_views)
+
+        btn_row.addStretch(1)
+        right_layout.addLayout(btn_row)
+
+        self.table = QTableView()
+        right_layout.addWidget(self.table)
+
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(1, 1)
+
+    # ------------- selection / double-click -------------
+    def _on_selection_changed(self, cur, prev):
+        self._load_current_view()       # rebuild filter UI for the selected view
+        self._try_show_cached_current() # show last cached snapshot if available
+
+    def _on_double_click(self, item):
+        # do not query DB; just show last cached snapshot for this view
+        self._try_show_cached_current()
+
+    def _current_view_id(self):
+        it = self.list_views.currentItem()
+        return it.data(Qt.UserRole) if it else None
+
+    def _load_current_view(self):
+        vid = self._current_view_id()
+        self._current_view = self._view_by_id.get(vid)
+        filters = (self._current_view or {}).get("filters", [])
+        self.filters_form.build(filters)
+        self.status.showMessage("Selected view: {}".format(vid or ""), 4000)
+
+    # ------------- show cached snapshot helpers -------------
+    def _show_df(self, df, view_id, source="cache"):
+        self.table.setModel(DataFrameModel(df))
+        self.table.resizeColumnsToContents()
+        self.status.showMessage(
+            "Loaded from {} | Rows: {} | View: {}".format(source, df.shape[0], view_id),
+            5000
+        )
+
+    def _try_show_cached_current(self):
+        vid = self._current_view_id()
+        if not vid:
+            return
+        key = self._last_key_by_view.get(vid)
+        if not key:
+            return
+        df = self._cache.get(key)
+        if df is not None:
+            self._show_df(df, vid, source="cache")
+
+    # ---------------- Run (cache → DB) ----------------
+    def _run_current_view(self):
+        if not self._current_view:
+            return
+        try:
+            params = self.filters_form.collect_params()
+            sql, binds, headers, conn_name = self._builder.build(self._current_view, params)
+
+            # cache key includes view id + SQL + binds
+            key = DFCache.make_key(self._current_view.get("id"), sql, binds)
+
+            # Try cache first
+            df = self._cache.get(key)
+            if df is not None:
+                # remember this as the view's last snapshot and display
+                self._last_key_by_view[self._current_view.get("id")] = key
+                # Ensure headers match (rename if counts match)
+                if len(df.columns) == len(headers) and list(df.columns) != headers:
+                    df = df.copy()
+                    df.columns = headers
+                self._show_df(df, self._current_view.get("id"), source="cache")
+                return
+
+            # Not in cache → query DB on demand
+            conn_cfg = self._cfg.get_connection_by_name(conn_name)
+            ds = DataSource(conn_cfg)
+            self.status.showMessage("Querying database…", 3000)
+            df = ds.fetch_df(sql, binds)  # pandas DataFrame
+
+            # Align DataFrame headers with view labels if needed
+            if len(df.columns) == len(headers) and list(df.columns) != headers:
+                df.columns = headers
+
+            # Cache & remember last snapshot key
+            self._cache.set(key, df)
+            self._last_key_by_view[self._current_view.get("id")] = key
+
+            self._show_df(df, self._current_view.get("id"), source="DB")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    # ---------------- Loaders (queries/views) ----------------
+    def _open_cfg(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open queries.json", "", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            import json, os
+            with open(path, "r", encoding="utf-8") as f:
+                self._cfg._queries = json.load(f)  # swap queries dict in place
+            # Rebuild SQL builder with new queries/dialects/catalog
+            self._builder = SQLBuilder(self._cfg.queries)
+            # Clear cache & last snapshot pointers
+            self._cache.clear()
+            self._last_key_by_view.clear()
+            self.status.showMessage("Loaded config: {}".format(os.path.abspath(path)), 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", "Failed to load config:\n{}".format(e))
+
+    def _open_views(self):
+        # Let user pick a JSON file first; if canceled, offer a directory
+        path, _ = QFileDialog.getOpenFileName(self, "Open views.json (or Cancel to pick a directory)", "", "JSON Files (*.json)")
+        if path:
+            self._reload_views_from(path)
+            return
+        dir_path = QFileDialog.getExistingDirectory(self, "Open views directory")
+        if dir_path:
+            self._reload_views_from(dir_path)
+
+    def _reload_views_from(self, path_or_dir):
+        try:
+            loader = ConfigLoaderShim(self._cfg.queries, path_or_dir)
+            self._views = loader.views
+            self._view_by_id = {v["id"]: v for v in self._views}
+
+            # repopulate list
+            self.list_views.clear()
+            for v in self._views:
+                it = QListWidgetItem("{}  ({})".format(v.get("title", v["id"]), v["id"]))
+                it.setData(Qt.UserRole, v["id"])
+                self.list_views.addItem(it)
+
+            # Clear cache & last snapshot pointers
+            self._cache.clear()
+            self._last_key_by_view.clear()
+
+            # select first and rebuild filter UI; do NOT auto-query
+            if self.list_views.count() > 0:
+                self.list_views.setCurrentRow(0)
+                self._load_current_view()
+                self._try_show_cached_current()
+
+            import os
+            self.status.showMessage("Loaded views from: {}".format(os.path.abspath(path_or_dir)), 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", "Failed to load views:\n{}".format(e))
+
+
+# Helper to reload only views while keeping the existing queries dict
+class ConfigLoaderShim(object):
+    def __init__(self, queries_dict, views_path):
+        self._queries = queries_dict
+        # reuse Config internals for view loading
+        tmp = Config.__new__(Config)          # bypass __init__
+        tmp._load_json = Config._load_json    # bind methods
+        tmp._load_views_any = Config._load_views_any
+        self.views = tmp._load_views_any(views_path)
+

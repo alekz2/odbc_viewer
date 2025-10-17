@@ -1,0 +1,32 @@
+{
+  "view": {
+    "id": "dep_emp_count",
+    "title": "Department Employee Count",
+    "connection": "ORCL_ODBC",
+    "from": [
+      { "table": "HR.DEPARTMENTS", "alias": "d" },
+      { "table": "HR.EMPLOYEES", "alias": "e",
+        "join": { "type": "INNER", "on": "e.DEPARTMENT_ID = d.DEPARTMENT_ID" }
+      }
+    ],
+    "select": [
+      { "kind": "column", "expr": "d.DEPARTMENT_NAME", "alias": "department", "label": "Department" },
+      { "kind": "agg", "func": "COUNT", "args": ["*"], "alias": "emp_count", "label": "Employees" }
+    ],
+    "group_by": ["d.DEPARTMENT_NAME"],
+    "filters": [
+      {
+        "id": "min_emp",
+        "label": "Min employees",
+        "type": "int",
+        "enabled": false,
+        "clause": "having",
+        "where": "COUNT(*) >= ?",
+        "param_order": ["min_emp"]
+      }
+    ],
+    "order_by": ["department ASC"],
+    "limit": { "rows": 1000, "offset": 0 }
+  }
+}
+

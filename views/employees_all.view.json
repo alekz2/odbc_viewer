@@ -1,0 +1,59 @@
+{
+  "view": {
+    "id": "employees_all",
+    "title": "All Employees",
+    "connection": "ORCL_ODBC",
+    "from": [
+      {
+        "table": "HR.EMPLOYEES",
+        "alias": "e"
+      }
+    ],
+    "select": [
+      {
+        "kind": "column",
+        "expr": "e.EMPLOYEE_ID",
+        "alias": "employee_id",
+        "label": "ID"
+      },
+      {
+        "kind": "column",
+        "expr": "e.FIRST_NAME",
+        "alias": "first_name",
+        "label": "First Name"
+      },
+      {
+        "kind": "column",
+        "expr": "e.LAST_NAME",
+        "alias": "last_name",
+        "label": "Last Name"
+      },
+      {
+        "kind": "column",
+        "expr": "e.DEPARTMENT_ID",
+        "alias": "department_id",
+        "label": "Dept ID"
+      },
+      {
+        "kind": "column",
+        "expr": "e.HIRE_DATE",
+        "alias": "hire_date",
+        "label": "Hire Date"
+      },
+      {
+        "kind": "column",
+        "expr": "e.SALARY",
+        "alias": "salary",
+        "label": "Salary"
+      }
+    ],
+    "order_by": [
+      "employee_id ASC"
+    ],
+    "limit": {
+      "rows": 1000,
+      "offset": 0
+    },
+    "filters": []
+  }
+}

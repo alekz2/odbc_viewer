@@ -31,7 +31,7 @@ class MainWindow(QMainWindow):
         # Runtime state
         self._cache = DFCache(capacity=cache_capacity)
         self._last_key_by_view = {}     # view_id -> last DFCache key
-        self._col_filters = {}          # col_index -> pattern string
+        self._col_filters_by_view = {}  # view_id -> { col_index -> pattern string }
         self._hidden_cols = set()       # set of hidden column indices
 
         self._build_ui()
@@ -103,14 +103,16 @@ class MainWindow(QMainWindow):
         hdr.setSectionsMovable(True)       # allow drag-to-reorder columns
         hdr.setStretchLastSection(False)
         self.table.setHorizontalHeader(hdr)
+
         hdr.bind(
-            get_current_filter_callable=lambda col: self._col_filters.get(col),
+            get_current_filter_callable=lambda col: self._current_filters().get(col),
             set_column_filter_callable=self._on_set_column_filter,
             toggle_column_visible_callable=self._on_toggle_column_visible,
             columns_provider_callable=self._columns_provider,
             sort_request_callable=self._on_sort_request,
             clear_all_filters_callable=self._on_clear_all_filters
         )
+
 
         right_layout.addWidget(self.table)
 
@@ -138,6 +140,10 @@ class MainWindow(QMainWindow):
         filters = (self._current_view or {}).get("filters", [])
         self.filters_form.build(filters)
         self.status.showMessage("Selected view: {}".format(vid or ""), 4000)
+
+    def _current_filters(self):
+        return self._col_filters_by_view.setdefault(self._current_view_id() or "", {})
+
 
     # ---------------- Show cached snapshot ----------------
     def _try_show_cached_current(self):
@@ -198,25 +204,25 @@ class MainWindow(QMainWindow):
 
     # ---------------- Table setup and header integration ----------------
     def _set_table_df(self, df):
-        """Set DataFrame on proxy model and reapply filters/visibility with stable row labels."""
         base = DataFrameModel(df)
 
-        # Stable vertical labels: prefer df.index if present; otherwise 1..N
-        try:
-            # Use the index values as labels
-            labels = [str(i) for i in df.index]
-        except Exception:
-            labels = [str(i + 1) for i in range(len(df))]
+        # stable labels…
+        #labels = [str(i) for i in df.index] if hasattr(df, "index") else [str(i+1) for i in range(len(df))]
 
         self._proxy.setSourceModel(base)
-        # self._proxy.setSourceRowLabels(labels)  # ensures vertical header is stable
-        self.table.setModel(self._proxy)
+        #self._proxy.setSourceRowLabels(labels)
 
+        self.table.setModel(self._proxy)
         self.table.resizeColumnsToContents()
         self._reapply_visibility(df)
-        # re-apply filters
-        for col, patt in self._col_filters.items():
+
+        # >>> prevent cross-view leakage <<<
+        self._proxy.clearAllFilters()                   # <-- clears previous view’s filters
+
+        # re-apply ONLY this view’s filters
+        for col, patt in self._current_filters().items():
             self._proxy.setColumnFilter(col, patt)
+
 
     def _reapply_visibility(self, df):
         self._hidden_cols = {c for c in self._hidden_cols if 0 <= c < df.shape[1]}
@@ -224,16 +230,18 @@ class MainWindow(QMainWindow):
             self.table.setColumnHidden(c, c in self._hidden_cols)
 
     def _on_set_column_filter(self, col, text):
+        cur = self._current_filters()
         if not text:
-            self._col_filters.pop(col, None)
+            cur.pop(col, None)
         else:
-            self._col_filters[col] = text
+            cur[col] = text
         self._proxy.setColumnFilter(col, text)
 
     def _on_clear_all_filters(self):
-        self._col_filters.clear()
+        # Clear only for the ACTIVE VIEW
+        cur = self._current_filters().clear()
         self._proxy.clearAllFilters()
-        self.status.showMessage("Cleared all column filters", 3000)
+        self.status.showMessage("Cleared all column filters for this view", 3000)
 
     def _on_toggle_column_visible(self, col, visible):
         if visible:

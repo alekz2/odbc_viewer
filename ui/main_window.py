@@ -1,10 +1,13 @@
 # ui/main_window.py
 # Python 3.6.9
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QLabel, QSplitter, QPushButton, QFileDialog, QMessageBox, QTableView, QStatusBar
 )
+
+import pandas as pd
 
 from odbc_viewer.core.datasource import DataSource
 from odbc_viewer.core.sqlbuilder import SQLBuilder
@@ -14,60 +17,65 @@ from odbc_viewer.ui.filter_form import FilterForm
 from odbc_viewer.ui.models import DataFrameModel, ColumnFilterProxyModel
 from odbc_viewer.ui.header import PopupHeader
 
-import pandas as pd
-
 
 class MainWindow(QMainWindow):
-    """Main UI for the ODBC Viewer app with caching and enhanced table features."""
+    """Main UI for the ODBC Viewer app with caching, per-view filters, and per-view column visibility."""
+
     def __init__(self, cfg, cache_capacity=10):
         super().__init__()
         self.setWindowTitle("PyQt5 ODBC Viewer (cached + filterable)")
         self.resize(1200, 750)
 
+        # ------- Config / queries / views -------
         self._cfg = cfg
         self._builder = SQLBuilder(cfg.queries)
         self._views = cfg.views
         self._view_by_id = {v["id"]: v for v in self._views}
         self._current_view = None
 
-        # Runtime state
+        # ------- Runtime state -------
         self._cache = DFCache(capacity=cache_capacity)
-        self._last_key_by_view = {}     # view_id -> last DFCache key
-        self._col_filters_by_view = {}  # view_id -> { col_index -> pattern string }
-        self._form_values_by_view = {}  # view_id -> {field_name -> value }
-        self._hidden_cols = set()       # set of hidden column indices
+        self._last_key_by_view = {}            # view_id -> last DFCache key
+        self._col_filters_by_view = {}         # view_id -> { col_index -> pattern string }
+        self._form_values_by_view = {}         # view_id -> { field_name -> value }
+        self._hidden_cols_by_view = {}         # view_id -> set(column_index)   <<< per-view now
 
         self._build_ui()
 
         # Populate left panel with all views
         for v in self._views:
-            it = QListWidgetItem("{}  ({})".format(v.get("title", v["id"]), v["id"]))
+            it = QListWidgetItem("{} ({})".format(v.get("title", v["id"]), v["id"]))
             it.setData(Qt.UserRole, v["id"])
             self.list_views.addItem(it)
 
         # Select first view by default
         if self.list_views.count() > 0:
             self.list_views.setCurrentRow(0)
-            self._load_current_view()
-            self._restore_form_values()
-            self._show_cached_or_empty()
+
+        # Initial load/restore
+        self._load_current_view()
+        self._restore_form_values()
+        self._show_cached_or_empty()
+        self.activate_view()  # ensure per-view state is applied on first load
 
     # ---------------- UI construction ----------------
     def _build_ui(self):
         splitter = QSplitter(self)
         self.setCentralWidget(splitter)
 
-        # ---------- Left panel (Views list) ----------
+        # ---------- Left: Views list ----------
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(QLabel("Views"))
+
         self.list_views = QListWidget()
         self.list_views.currentItemChanged.connect(self._on_selection_changed)
         self.list_views.itemDoubleClicked.connect(self._on_double_click)
         left_layout.addWidget(self.list_views)
+
         splitter.addWidget(left)
 
-        # ---------- Right panel (Filters + Buttons + Table) ----------
+        # ---------- Right: Filters + Buttons + Table ----------
         right = QWidget()
         right_layout = QVBoxLayout(right)
 
@@ -75,7 +83,7 @@ class MainWindow(QMainWindow):
         self.filters_form = FilterForm()
         right_layout.addWidget(self.filters_form)
 
-        # Button row
+        # Buttons row
         btn_row = QHBoxLayout()
         self.btn_run = QPushButton("Run")
         self.btn_run.clicked.connect(self._run_current_view)
@@ -98,13 +106,13 @@ class MainWindow(QMainWindow):
         # Right-align vertical numbers for readability
         self.table.verticalHeader().setDefaultAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        # Proxy model for per-column filtering/sorting (+ stable row labels)
+        # Proxy model for per-column filtering/sorting (+ stable row labels if you use them)
         self._proxy = ColumnFilterProxyModel(self)
         self.table.setModel(self._proxy)
 
         # Popup header
         hdr = PopupHeader(Qt.Horizontal, self.table)
-        hdr.setSectionsMovable(True)       # allow drag-to-reorder columns
+        hdr.setSectionsMovable(True)      # allow drag-to-reorder columns
         hdr.setStretchLastSection(False)
         self.table.setHorizontalHeader(hdr)
 
@@ -114,14 +122,14 @@ class MainWindow(QMainWindow):
             toggle_column_visible_callable=self._on_toggle_column_visible,
             columns_provider_callable=self._columns_provider,
             sort_request_callable=self._on_sort_request,
-            clear_all_filters_callable=self._on_clear_all_filters
+            clear_all_filters_callable=self._on_clear_all_filters,
         )
-
 
         right_layout.addWidget(self.table)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
 
@@ -136,7 +144,7 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", str(e))
 
-        # 2) Load new view, rebuild form UI
+        # 2) Load new view & rebuild form UI
         self._load_current_view()
 
         # 3) Restore saved values (if any) for the newly selected view
@@ -145,10 +153,13 @@ class MainWindow(QMainWindow):
         # 4) Show last cached df (or empty)
         self._show_cached_or_empty()
 
+        # 5) Re-apply this view’s column visibility & column filters
+        self.activate_view()
 
     def _on_double_click(self, item):
         # Show last cached data, don't query DB
         self._try_show_cached_current()
+        self.activate_view()
 
     def _current_view_id(self):
         it = self.list_views.currentItem()
@@ -166,7 +177,6 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
-
     def _load_current_view(self):
         vid = self._current_view_id()
         self._current_view = self._view_by_id.get(vid)
@@ -180,30 +190,34 @@ class MainWindow(QMainWindow):
         if not vid:
             self._clear_table()
             return
+
         key = self._last_key_by_view.get(vid)
         if not key:
             self._clear_table()
             return
+
         df = self._cache.get(key)
         if df is not None:
             self._set_table_df(df)  # will display empty data if df is empty (shape[0]==0)
             self.status.showMessage(
-                f"Loaded last cached data | Rows: {df.shape[0]} | View: {vid}", 4000
+                "Loaded last cached data | Rows: {} | View: {}".format(df.shape[0], vid), 4000
             )
         else:
             # cache entry was evicted or cleared
-            self._clear_table()        
+            self._clear_table()
 
     def _current_filters(self):
         return self._col_filters_by_view.setdefault(self._current_view_id() or "", {})
 
+    def _current_hidden_cols(self):
+        """Return the hidden-column set for the active view (mutable)."""
+        return self._hidden_cols_by_view.setdefault(self._current_view_id() or "", set())
+
     def _clear_table(self):
-        """ Show an empty grid for the active view."""
+        """Show an empty grid for the active view."""
         empty_df = pd.DataFrame()
         self._set_table_df(empty_df)
-        
         self.status.showMessage("No cached data for this view", 3000)
-
 
     # ---------------- Show cached snapshot ----------------
     def _try_show_cached_current(self):
@@ -231,17 +245,22 @@ class MainWindow(QMainWindow):
                 self._form_values_by_view[vid] = dict(params)
 
             sql, binds, headers, conn_name = self._builder.build(self._current_view, params)
+
             key = DFCache.make_key(self._current_view.get("id"), sql, binds)
 
-            # Cache hit
+            # Cache hit?
             df = self._cache.get(key)
             if df is not None:
                 self._last_key_by_view[self._current_view.get("id")] = key
                 if len(df.columns) == len(headers) and list(df.columns) != headers:
-                    df = df.copy(); df.columns = headers
+                    df = df.copy()
+                    df.columns = headers
                 self._set_table_df(df)
                 self.status.showMessage(
-                    "Loaded from cache | Rows: {} | View: {}".format(df.shape[0], self._current_view.get("id")), 6000
+                    "Loaded from cache | Rows: {} | View: {}".format(
+                        df.shape[0], self._current_view.get("id")
+                    ),
+                    6000,
                 )
                 return
 
@@ -252,6 +271,7 @@ class MainWindow(QMainWindow):
             df = ds.fetch_df(sql, binds)
 
             if len(df.columns) == len(headers) and list(df.columns) != headers:
+                df = df.copy()
                 df.columns = headers
 
             # Cache and show
@@ -261,37 +281,40 @@ class MainWindow(QMainWindow):
             self.status.showMessage(
                 "Fetched from DB | Rows: {} | Dialect: {} | View: {}".format(
                     df.shape[0], conn_cfg["dialect"], self._current_view.get("id")
-                ), 6000
+                ),
+                6000,
             )
+
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
     # ---------------- Table setup and header integration ----------------
     def _set_table_df(self, df):
         base = DataFrameModel(df)
-
-        # stable labels…
-        #labels = [str(i) for i in df.index] if hasattr(df, "index") else [str(i+1) for i in range(len(df))]
-
         self._proxy.setSourceModel(base)
-        #self._proxy.setSourceRowLabels(labels)
-
         self.table.setModel(self._proxy)
         self.table.resizeColumnsToContents()
+
+        # Re-apply only the ACTIVE VIEW's visibility & filters
         self._reapply_visibility(df)
 
-        # >>> prevent cross-view leakage <<<
-        self._proxy.clearAllFilters()                   # <-- clears previous view’s filters
+        # Prevent cross-view leakage of column filters
+        self._proxy.clearAllFilters()
 
-        # re-apply ONLY this view’s filters
+        # Re-apply ONLY this view’s column filters
         for col, patt in self._current_filters().items():
             self._proxy.setColumnFilter(col, patt)
 
-
     def _reapply_visibility(self, df):
-        self._hidden_cols = {c for c in self._hidden_cols if 0 <= c < df.shape[1]}
+        hidden = self._current_hidden_cols()
+        # prune out-of-range indices (if schema changed)
+        pruned = {c for c in hidden if 0 <= c < df.shape[1]}
+        if pruned != hidden:
+            hidden.clear()
+            hidden.update(pruned)
+
         for c in range(df.shape[1]):
-            self.table.setColumnHidden(c, c in self._hidden_cols)
+            self.table.setColumnHidden(c, c in hidden)
 
     def _on_set_column_filter(self, col, text):
         cur = self._current_filters()
@@ -303,15 +326,16 @@ class MainWindow(QMainWindow):
 
     def _on_clear_all_filters(self):
         # Clear only for the ACTIVE VIEW
-        cur = self._current_filters().clear()
+        self._current_filters().clear()
         self._proxy.clearAllFilters()
         self.status.showMessage("Cleared all column filters for this view", 3000)
 
     def _on_toggle_column_visible(self, col, visible):
+        hidden = self._current_hidden_cols()
         if visible:
-            self._hidden_cols.discard(col)
+            hidden.discard(col)
         else:
-            self._hidden_cols.add(col)
+            hidden.add(col)
         self.table.setColumnHidden(col, not visible)
 
     def _columns_provider(self):
@@ -319,9 +343,10 @@ class MainWindow(QMainWindow):
         if src is None:
             return []
         cols = []
+        hidden = self._current_hidden_cols()
         for c in range(src.columnCount()):
             title = src.headerData(c, Qt.Horizontal)
-            visible = (c not in self._hidden_cols)
+            visible = (c not in hidden)
             cols.append((c, str(title), visible))
         return cols
 
@@ -338,17 +363,23 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8") as f:
                 self._cfg._queries = json.load(f)
             self._builder = SQLBuilder(self._cfg.queries)
+
+            # Reset caches (queries changed)
             self._cache.clear()
             self._last_key_by_view.clear()
+
             self.status.showMessage("Loaded config: {}".format(os.path.abspath(path)), 5000)
         except Exception as e:
             QMessageBox.critical(self, "Error", "Failed to load config:\n{}".format(e))
 
     def _open_views(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open views.json (or Cancel to pick a directory)", "", "JSON Files (*.json)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open views.json (or Cancel to pick a directory)", "", "JSON Files (*.json)"
+        )
         if path:
             self._reload_views_from(path)
             return
+
         dir_path = QFileDialog.getExistingDirectory(self, "Open views directory")
         if dir_path:
             self._reload_views_from(dir_path)
@@ -358,32 +389,75 @@ class MainWindow(QMainWindow):
             loader = ConfigLoaderShim(self._cfg.queries, path_or_dir)
             self._views = loader.views
             self._view_by_id = {v["id"]: v for v in self._views}
+
             self.list_views.clear()
             for v in self._views:
-                it = QListWidgetItem("{}  ({})".format(v.get("title", v["id"]), v["id"]))
+                it = QListWidgetItem("{} ({})".format(v.get("title", v["id"]), v["id"]))
                 it.setData(Qt.UserRole, v["id"])
                 self.list_views.addItem(it)
+
+            # Reset caches for new views
             self._cache.clear()
             self._last_key_by_view.clear()
 
             if self.list_views.count() > 0:
                 self.list_views.setCurrentRow(0)
-                self._load_current_view()
-                self._restore_form_values()
-                self._try_show_cached_current()
+            self._load_current_view()
+            self._restore_form_values()
+            self._try_show_cached_current()
+            self.activate_view()
 
             import os
             self.status.showMessage("Loaded views from: {}".format(os.path.abspath(path_or_dir)), 5000)
         except Exception as e:
             QMessageBox.critical(self, "Error", "Failed to load views:\n{}".format(e))
 
+    # ---------------- Helper: reload only views ----------------
+    class ConfigLoaderShim(object):
+        def __init__(self, queries_dict, views_path):
+            self._queries = queries_dict
+            tmp = Config.__new__(Config)
+            tmp._load_json = Config._load_json
+            tmp._load_views_any = Config._load_views_any
+            self.views = tmp._load_views_any(views_path)
 
-# ---------------- Helper: reload only views ----------------
-class ConfigLoaderShim(object):
-    def __init__(self, queries_dict, views_path):
-        self._queries = queries_dict
-        tmp = Config.__new__(Config)
-        tmp._load_json = Config._load_json
-        tmp._load_views_any = Config._load_views_any
-        self.views = tmp._load_views_any(views_path)
+    # ---------------- Public helper to re-apply current view state ----------------
+    def activate_view(self, view_id=None):
+        """
+        Re-apply the ACTIVE (or specified) view's per-view state:
+          - column visibility
+          - column filters (already handled in _set_table_df, but safe to call after cached view)
+        """
+        # If a specific view_id was passed, move selection (optional convenience)
+        if view_id is not None:
+            # try to select the matching item if different
+            it = self.list_views.currentItem()
+            cur_id = it.data(Qt.UserRole) if it else None
+            if cur_id != view_id:
+                # naive linear search is fine for short lists
+                for row in range(self.list_views.count()):
+                    if self.list_views.item(row).data(Qt.UserRole) == view_id:
+                        self.list_views.setCurrentRow(row)
+                        break
+
+        # Re-apply visibility against whatever model is currently shown
+        src = self._proxy.sourceModel()
+        ncols = src.columnCount() if src else 0
+        hidden = self._current_hidden_cols()
+
+        # Clamp indices
+        hidden_to_apply = {c for c in hidden if 0 <= c < ncols}
+        if hidden_to_apply != hidden:
+            hidden.clear()
+            hidden.update(hidden_to_apply)
+
+        for c in range(ncols):
+            self.table.setColumnHidden(c, c in hidden)
+
+        # Re-apply column filters
+        self._proxy.clearAllFilters()
+        for col, patt in self._current_filters().items():
+            self._proxy.setColumnFilter(col, patt)
+
+
 

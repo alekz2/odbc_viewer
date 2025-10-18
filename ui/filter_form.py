@@ -1,5 +1,4 @@
 # ui/filter_form.py
-# Python 3.6.9
 import datetime
 from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtWidgets import (
@@ -9,22 +8,27 @@ from PyQt5.QtWidgets import (
 
 class FilterForm(QWidget):
     """
-    Dynamic filter UI builder.
-    Renders one group per filter; one control per param id in param_order.
+    Dynamic filter UI builder with per-parameter registry so we can
+    get/set values programmatically (collect_params / set_values).
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         outer.addWidget(self._scroll)
+
         self._container = QWidget()
         self._vbox = QVBoxLayout(self._container)
         self._vbox.setContentsMargins(8, 8, 8, 8)
         self._vbox.setSpacing(8)
         self._scroll.setWidget(self._container)
-        self._rows = []
+
+        # rows hold per-filter UI pieces; registry holds per-param I/O helpers
+        self._rows = []  # [{filter, chk, controls:[(pid, reader, writer)]}]
+        self._inputs_by_param = {}  # pid -> (widget, reader, writer)
 
     def clear(self):
         while self._vbox.count():
@@ -33,6 +37,7 @@ class FilterForm(QWidget):
             if w:
                 w.deleteLater()
         self._rows = []
+        self._inputs_by_param = {}
 
     def build(self, filters):
         self.clear()
@@ -40,11 +45,12 @@ class FilterForm(QWidget):
         for flt in filters:
             group = QGroupBox(self._title_for(flt))
             vbox = QVBoxLayout(group)
+
+            # Top row: enable + tag
             top = QHBoxLayout()
             chk = QCheckBox("Enable")
             chk.setChecked(bool(flt.get("enabled", False)))
             top.addWidget(chk)
-            # tag HAVING visually
             if (flt.get("clause") or "where").lower() == "having":
                 tag = QLabel("(HAVING)")
                 tag.setStyleSheet("color: gray;")
@@ -52,21 +58,27 @@ class FilterForm(QWidget):
             top.addStretch(1)
             vbox.addLayout(top)
 
+            # Params
             form = QFormLayout()
             vbox.addLayout(form)
 
             pids = flt.get("param_order", [flt["id"]])
             controls = []
             defaults = flt.get("default", None)
+
             for pid in pids:
                 ftype = (flt.get("type") or "string").lower()
                 if isinstance(flt.get("types"), dict):
                     ftype = flt["types"].get(pid, ftype)
+
                 dval = defaults.get(pid) if isinstance(defaults, dict) else defaults
-                w, reader = self._make_control(ftype, dval, flt)
+                w, reader, writer = self._make_control(ftype, dval, flt)
+
                 label = pid if len(pids) > 1 else flt.get("label", pid)
                 form.addRow(QLabel(label + ":"), w)
-                controls.append((pid, reader))
+
+                controls.append((pid, reader, writer))
+                self._inputs_by_param[pid] = (w, reader, writer)
 
             self._rows.append({"filter": flt, "chk": chk, "controls": controls})
             self._vbox.addWidget(group)
@@ -76,19 +88,25 @@ class FilterForm(QWidget):
         self._vbox.addWidget(spacer)
 
     def collect_params(self):
+        """
+        Returns a dict of active parameter values.
+        A filter is considered active if its 'Enable' is checked OR the user typed any value.
+        """
         params = {}
         for row in self._rows:
             flt = row["filter"]
             enabled = row["chk"].isChecked() or bool(flt.get("enabled", False))
             temp = {}
             any_val = False
-            for pid, reader in row["controls"]:
+
+            for pid, reader, _writer in row["controls"]:
                 val = reader()
                 if isinstance(val, str) and val == "":
                     val = None
                 if val is not None:
                     any_val = True
                 temp[pid] = val
+
             if enabled or any_val:
                 defaults = flt.get("default", None)
                 for pid in list(temp.keys()):
@@ -102,33 +120,98 @@ class FilterForm(QWidget):
                         params[k] = v
         return params
 
-    # --- helpers ---
+    def set_values(self, values, enable_if_present=True):
+        """
+        Populate widgets from {param_id: value}.
+        If enable_if_present=True, any filter that has at least one param in 'values'
+        gets its 'Enable' checkbox checked.
+        """
+        if not values:
+            return
+
+        # Write param values via writers
+        for pid, val in values.items():
+            entry = self._inputs_by_param.get(pid)
+            if not entry:
+                continue
+            _w, _reader, writer = entry
+            try:
+                writer(val)
+            except Exception:
+                # Best effort: ignore invalid types
+                pass
+
+        if enable_if_present:
+            # Toggle the 'Enable' checkbox for filters that received values
+            present = set(values.keys())
+            for row in self._rows:
+                pids = [pid for (pid, _r, _w) in row["controls"]]
+                if any(pid in present for pid in pids):
+                    row["chk"].setChecked(True)
+
+    # ---------- helpers ----------
     def _title_for(self, flt):
         return flt.get("label") or flt.get("id") or "Filter"
 
     def _make_control(self, ftype, default, flt):
+        """
+        Return (widget, reader, writer).
+        Writer accepts a Python value and updates the widget appropriately.
+        """
+        # int
         if ftype == "int":
             w = QSpinBox(); w.setRange(-2_147_483_648, 2_147_483_647)
-            w.setValue(default if isinstance(default, int) else 0)
-            return w, (lambda w=w: w.value())
+            if isinstance(default, int):
+                w.setValue(default)
+            def reader(w=w): return w.value()
+            def writer(val, w=w):
+                try: w.setValue(int(val))
+                except Exception: pass
+            return w, reader, writer
 
+        # float
         if ftype == "float":
             w = QDoubleSpinBox(); w.setDecimals(6); w.setRange(-1e12, 1e12)
-            w.setValue(float(default) if isinstance(default, (int, float)) else 0.0)
-            return w, (lambda w=w: w.value())
+            if isinstance(default, (int, float)):
+                w.setValue(float(default))
+            def reader(w=w): return w.value()
+            def writer(val, w=w):
+                try: w.setValue(float(val))
+                except Exception: pass
+            return w, reader, writer
 
+        # date
         if ftype == "date":
             w = QDateEdit(); w.setCalendarPopup(True)
             if isinstance(default, (datetime.date, datetime.datetime)):
                 w.setDate(QDate(default.year, default.month, default.day))
             else:
                 w.setDate(QDate.currentDate())
-            return w, (lambda w=w: datetime.date(w.date().year(), w.date().month(), w.date().day()))
+            def reader(w=w):
+                d = w.date(); return datetime.date(d.year(), d.month(), d.day())
+            def writer(val, w=w):
+                try:
+                    if isinstance(val, datetime.datetime):
+                        val = val.date()
+                    if isinstance(val, datetime.date):
+                        w.setDate(QDate(val.year, val.month, val.day))
+                    else:
+                        # try parse yyyy-mm-dd
+                        y, m, d = str(val).split("-")
+                        w.setDate(QDate(int(y), int(m), int(d)))
+                except Exception:
+                    pass
+            return w, reader, writer
 
+        # bool
         if ftype == "bool":
-            w = QCheckBox(); w.setChecked(bool(default))
-            return w, (lambda w=w: w.isChecked())
+            w = QCheckBox()
+            w.setChecked(bool(default))
+            def reader(w=w): return w.isChecked()
+            def writer(val, w=w): w.setChecked(bool(val))
+            return w, reader, writer
 
+        # enum
         if ftype == "enum":
             w = QComboBox()
             choices = flt.get("choices", [])
@@ -137,18 +220,27 @@ class FilterForm(QWidget):
                     w.addItem(c.get("label", c.get("value")), c.get("value"))
                 else:
                     w.addItem(str(c), c)
+            # default selection
             if default is not None:
                 for i in range(w.count()):
                     if w.itemData(i) == default or w.itemText(i) == str(default):
                         w.setCurrentIndex(i); break
-            return w, (lambda w=w: w.currentData())
+            def reader(w=w): return w.currentData()
+            def writer(val, w=w):
+                # try by data first, then by text
+                for i in range(w.count()):
+                    if w.itemData(i) == val or w.itemText(i) == str(val):
+                        w.setCurrentIndex(i); return
+            return w, reader, writer
 
-        # default string
+        # string (default)
         w = QLineEdit()
         if default is not None:
             w.setText(str(default))
         else:
             if " like" in (flt.get("where", "").lower()):
                 w.setPlaceholderText("%")
-        return w, (lambda w=w: w.text())
+        def reader(w=w): return w.text()
+        def writer(val, w=w): w.setText("" if val is None else str(val))
+        return w, reader, writer
 

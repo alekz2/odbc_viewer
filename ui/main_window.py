@@ -34,6 +34,7 @@ class MainWindow(QMainWindow):
         self._cache = DFCache(capacity=cache_capacity)
         self._last_key_by_view = {}     # view_id -> last DFCache key
         self._col_filters_by_view = {}  # view_id -> { col_index -> pattern string }
+        self._form_values_by_view = {}  # view_id -> {field_name -> value }
         self._hidden_cols = set()       # set of hidden column indices
 
         self._build_ui()
@@ -48,7 +49,8 @@ class MainWindow(QMainWindow):
         if self.list_views.count() > 0:
             self.list_views.setCurrentRow(0)
             self._load_current_view()
-            self._try_show_cached_current()
+            self._restore_form_values()
+            self._show_cached_or_empty()
 
     # ---------------- UI construction ----------------
     def _build_ui(self):
@@ -125,8 +127,24 @@ class MainWindow(QMainWindow):
 
     # ---------------- View selection handlers ----------------
     def _on_selection_changed(self, cur, prev):
+        # 1) Save form values for the view we are leaving
+        if prev:
+            prev_id = prev.data(Qt.UserRole)
+            if prev_id:
+                try:
+                    self._form_values_by_view[prev_id] = self.filters_form.collect_params()
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+
+        # 2) Load new view, rebuild form UI
         self._load_current_view()
+
+        # 3) Restore saved values (if any) for the newly selected view
+        self._restore_form_values()
+
+        # 4) Show last cached df (or empty)
         self._show_cached_or_empty()
+
 
     def _on_double_click(self, item):
         # Show last cached data, don't query DB
@@ -135,6 +153,19 @@ class MainWindow(QMainWindow):
     def _current_view_id(self):
         it = self.list_views.currentItem()
         return it.data(Qt.UserRole) if it else None
+
+    def _restore_form_values(self):
+        vid = self._current_view_id()
+        if not vid:
+            return
+        values = self._form_values_by_view.get(vid)
+        if values:
+            try:
+                # set_values will also check the 'Enable' checkbox for filters whose params are present
+                self.filters_form.set_values(values, enable_if_present=True)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
+
 
     def _load_current_view(self):
         vid = self._current_view_id()
@@ -195,6 +226,10 @@ class MainWindow(QMainWindow):
             return
         try:
             params = self.filters_form.collect_params()
+            vid = self._current_view_id()
+            if vid:
+                self._form_values_by_view[vid] = dict(params)
+
             sql, binds, headers, conn_name = self._builder.build(self._current_view, params)
             key = DFCache.make_key(self._current_view.get("id"), sql, binds)
 
@@ -330,10 +365,13 @@ class MainWindow(QMainWindow):
                 self.list_views.addItem(it)
             self._cache.clear()
             self._last_key_by_view.clear()
+
             if self.list_views.count() > 0:
                 self.list_views.setCurrentRow(0)
                 self._load_current_view()
+                self._restore_form_values()
                 self._try_show_cached_current()
+
             import os
             self.status.showMessage("Loaded views from: {}".format(os.path.abspath(path_or_dir)), 5000)
         except Exception as e:

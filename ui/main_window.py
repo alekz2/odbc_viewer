@@ -14,6 +14,8 @@ from odbc_viewer.ui.filter_form import FilterForm
 from odbc_viewer.ui.models import DataFrameModel, ColumnFilterProxyModel
 from odbc_viewer.ui.header import PopupHeader
 
+import pandas as pd
+
 
 class MainWindow(QMainWindow):
     """Main UI for the ODBC Viewer app with caching and enhanced table features."""
@@ -124,7 +126,7 @@ class MainWindow(QMainWindow):
     # ---------------- View selection handlers ----------------
     def _on_selection_changed(self, cur, prev):
         self._load_current_view()
-        self._try_show_cached_current()
+        self._show_cached_or_empty()
 
     def _on_double_click(self, item):
         # Show last cached data, don't query DB
@@ -141,8 +143,35 @@ class MainWindow(QMainWindow):
         self.filters_form.build(filters)
         self.status.showMessage("Selected view: {}".format(vid or ""), 4000)
 
+    def _show_cached_or_empty(self):
+        """On view switch: show that view's last cached df, else clear table."""
+        vid = self._current_view_id()
+        if not vid:
+            self._clear_table()
+            return
+        key = self._last_key_by_view.get(vid)
+        if not key:
+            self._clear_table()
+            return
+        df = self._cache.get(key)
+        if df is not None:
+            self._set_table_df(df)  # will display empty data if df is empty (shape[0]==0)
+            self.status.showMessage(
+                f"Loaded last cached data | Rows: {df.shape[0]} | View: {vid}", 4000
+            )
+        else:
+            # cache entry was evicted or cleared
+            self._clear_table()        
+
     def _current_filters(self):
         return self._col_filters_by_view.setdefault(self._current_view_id() or "", {})
+
+    def _clear_table(self):
+        """ Show an empty grid for the active view."""
+        empty_df = pd.DataFrame()
+        self._set_table_df(empty_df)
+        
+        self.status.showMessage("No cached data for this view", 3000)
 
 
     # ---------------- Show cached snapshot ----------------
